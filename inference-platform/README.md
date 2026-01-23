@@ -111,10 +111,12 @@ curl -X POST https://your-host/v1/rerank \
 ## 📈 Monitoring
 
 ### Access Points
-- **Prometheus**: http://your-host:9090
-- **Grafana**: http://your-host:3000 (admin/admin)
+- **Prometheus**: https://your-host/prometheus/ (via HTTPS)
+- **Grafana**: https://your-host/grafana/ (admin/admin, via HTTPS)
 - **Gateway Metrics**: https://your-host/metrics
 - **Health Check**: https://your-host/health/detailed
+
+**Note**: All monitoring services are now accessible via HTTPS through nginx using the same SSL certificates. Direct HTTP access on ports 9090 and 3000 has been disabled for security.
 
 ### Key Metrics
 - Request rates, latencies (p50/p95/p99)

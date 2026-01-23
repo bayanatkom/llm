@@ -195,3 +195,11 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ../ssl_certificate:/etc/nginx/ssl:ro
+    networks:
+      - default
+      - monitoring
+
+networks:
+  monitoring:
+    external: true
+    name: inference-platform_monitoring
