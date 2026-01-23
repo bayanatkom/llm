@@ -1,0 +1,197 @@
+version: "3.9"
+
+services:
+  # --------------------
+  # Qwen Chat replicas (GPU0, GPU1)
+  # --------------------
+  chat0:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-chat0
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=0
+    volumes:
+      - ${HF_HOME:-./hf-cache}:/root/.cache/huggingface
+    expose:
+      - "8000"
+    command: >
+      vllm serve Qwen/Qwen2.5-7B-Instruct
+      --host 0.0.0.0 --port 8000
+      --api-key ${BACKEND_API_KEY}
+      --max-model-len 8192
+      --gpu-memory-utilization 0.90
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  chat1:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-chat1
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=1
+    volumes:
+      - ${HF_HOME:-./hf-cache}:/root/.cache/huggingface
+    expose:
+      - "8000"
+    command: >
+      vllm serve Qwen/Qwen2.5-7B-Instruct
+      --host 0.0.0.0 --port 8000
+      --api-key ${BACKEND_API_KEY}
+      --max-model-len 8192
+      --gpu-memory-utilization 0.90
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --------------------
+  # Text2SQL (GPU2)
+  # --------------------
+  text2sql:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-text2sql
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=2
+    volumes:
+      - ${HF_HOME:-./hf-cache}:/root/.cache/huggingface
+    expose:
+      - "8000"
+    command: >
+      vllm serve Snowflake/Arctic-Text2SQL-R1-7B
+      --host 0.0.0.0 --port 8000
+      --api-key ${BACKEND_API_KEY}
+      --max-model-len 8192
+      --gpu-memory-utilization 0.90
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --------------------
+  # Embeddings (GPU3)
+  # --------------------
+  embed:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-embed
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=3
+    volumes:
+      - ${HF_HOME:-./hf-cache}:/root/.cache/huggingface
+    expose:
+      - "8000"
+    command: >
+      vllm serve Snowflake/snowflake-arctic-embed-l-v2.0
+      --runner pooling
+      --host 0.0.0.0 --port 8000
+      --api-key ${BACKEND_API_KEY}
+      --gpu-memory-utilization 0.80
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --------------------
+  # Reranker (GPU3 - shared with embeddings)
+  # --------------------
+  rerank:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-rerank
+    restart: unless-stopped
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=3
+    volumes:
+      - ${HF_HOME:-./hf-cache}:/root/.cache/huggingface
+    expose:
+      - "8000"
+    command: >
+      vllm serve BAAI/bge-reranker-v2-m3
+      --runner pooling
+      --host 0.0.0.0 --port 8000
+      --api-key ${BACKEND_API_KEY}
+      --gpu-memory-utilization 0.80
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --------------------
+  # Gateway (CPU) - Enterprise features
+  # --------------------
+  gateway:
+    build: ./gateway
+    container_name: inference-gateway
+    restart: unless-stopped
+    depends_on:
+      - chat0
+      - chat1
+      - text2sql
+      - embed
+      - rerank
+    environment:
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY}
+      - BACKEND_API_KEY=${BACKEND_API_KEY}
+      - CHAT_BACKENDS=${CHAT_BACKENDS}
+      - TEXT2SQL_BACKEND=${TEXT2SQL_BACKEND}
+      - EMBED_BACKEND=${EMBED_BACKEND}
+      - RERANK_BACKEND=${RERANK_BACKEND}
+      - MAX_RPS_PER_IP=${MAX_RPS_PER_IP}
+      - RPS_WINDOW_SECS=${RPS_WINDOW_SECS}
+      - RPS_BURST=${RPS_BURST}
+      - MAX_INFLIGHT_PER_IP=${MAX_INFLIGHT_PER_IP}
+      - QUEUE_TIMEOUT_SECS=${QUEUE_TIMEOUT_SECS}
+      - MAX_REQUEST_SECS=${MAX_REQUEST_SECS}
+      - STREAM_IDLE_TIMEOUT_SECS=${STREAM_IDLE_TIMEOUT_SECS}
+      - ORG_DAILY_TOKEN_LIMIT=${ORG_DAILY_TOKEN_LIMIT}
+      - ORG_DAILY_REQUEST_LIMIT=${ORG_DAILY_REQUEST_LIMIT}
+      - ORG_MONTHLY_TOKEN_LIMIT=${ORG_MONTHLY_TOKEN_LIMIT}
+      - CACHE_TTL_SECS=${CACHE_TTL_SECS}
+      - CACHE_MAX_SIZE=${CACHE_MAX_SIZE}
+      - CIRCUIT_FAILURE_THRESHOLD=${CIRCUIT_FAILURE_THRESHOLD}
+      - CIRCUIT_RECOVERY_TIMEOUT=${CIRCUIT_RECOVERY_TIMEOUT}
+      - HEALTH_CHECK_INTERVAL_SECS=${HEALTH_CHECK_INTERVAL_SECS}
+      - HEALTH_CHECK_TIMEOUT_SECS=${HEALTH_CHECK_TIMEOUT_SECS}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENABLE_PII_REDACTION=${ENABLE_PII_REDACTION}
+      - GATEWAY_WORKERS=${GATEWAY_WORKERS}
+    expose:
+      - "9000"
+
+  # --------------------
+  # Nginx TLS (public)
+  # --------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: inference-nginx
+    restart: unless-stopped
+    depends_on:
+      - gateway
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../ssl_certificate:/etc/nginx/ssl:ro
