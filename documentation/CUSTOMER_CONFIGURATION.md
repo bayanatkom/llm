@@ -14,27 +14,25 @@
 
 ## Available Models
 
-### 1. General Chat Model (Qwen 2.5 7B Instruct)
+### 1. General Chat & Text2SQL Model (Qwen 2.5 14B Instruct AWQ)
 
 | Setting | Value |
 |---------|-------|
-| **Model ID (OpenRouter-style)** | `qwen/qwen-2.5-7b-instruct` |
-| **Model ID (HuggingFace-style)** | `Qwen/Qwen2.5-7B-Instruct` |
+| **Model ID (OpenRouter-style)** | `qwen/qwen-2.5-14b-instruct` |
+| **Model ID (HuggingFace-style)** | `Qwen/Qwen2.5-14B-Instruct-AWQ` |
 | **Endpoint** | `https://llm.bayanatkom.com/v1/chat/completions` |
-| **Context Length** | `8192` |
-| **Max Output Tokens** | `4096` |
+| **Context Length** | `97280` (95K tokens) |
+| **Max Output Tokens** | `8192` |
 | **Type** | Chat Completion |
+| **Quantization** | AWQ 4-bit |
+| **Features** | Tool calling, 95K context with YaRN, ~3.9x concurrent capacity |
 
-### 2. Text-to-SQL Model (Arctic Text2SQL R1 7B)
+This is a **consolidated model** that handles both general chat and text2SQL tasks.
+It runs on 4x L4 GPUs with tensor parallelism and AWQ quantization for optimal throughput.
 
-| Setting | Value |
-|---------|-------|
-| **Model ID (OpenRouter-style)** | `snowflake/arctic-text2sql-r1-7b` |
-| **Model ID (HuggingFace-style)** | `Snowflake/Arctic-Text2SQL-R1-7B` |
-| **Endpoint** | `https://llm.bayanatkom.com/v1/completions` |
-| **Context Length** | `8192` |
-| **Max Output Tokens** | `4096` |
-| **Type** | Text Completion |
+**Legacy aliases** (still work, redirect to Qwen 14B AWQ):
+- `qwen/qwen-2.5-7b-instruct` → Qwen 14B AWQ
+- `snowflake/arctic-text2sql-r1-7b` → Qwen 14B AWQ
 
 ---
 
@@ -56,9 +54,8 @@ API Base:       https://llm.bayanatkom.com/v1
 API Key:        4957a0d56333b448ef02b9546d5286969a3586cec917c638164c5790191fe9f8
 Provider Name:  Openrouter (or custom)
 
-Model IDs:
-  - qwen/qwen-2.5-7b-instruct       (Chat)
-  - snowflake/arctic-text2sql-r1-7b (Text2SQL)
+Model ID:       qwen/qwen-2.5-14b-instruct
+Context Length: 97280 (95K tokens)
 ```
 
 ---
@@ -67,32 +64,16 @@ Model IDs:
 
 For LiteLLM-compatible systems, use these values:
 
-### Option 1: Chat Model Configuration
-
 ```
 API Key:        4957a0d56333b448ef02b9546d5286969a3586cec917c638164c5790191fe9f8
 API Base:       https://llm.bayanatkom.com
 API Version:    v1
 
 Model Configurations:
-  - Model Name:       Qwen/Qwen2.5-7B-Instruct
-  - Max Input Tokens: 8192
+  - Model Name:       Qwen/Qwen2.5-14B-Instruct-AWQ
+  - Max Input Tokens: 97280
 
-Default Model: Qwen/Qwen2.5-7B-Instruct
-```
-
-### Option 2: Text2SQL Model Configuration
-
-```
-API Key:        4957a0d56333b448ef02b9546d5286969a3586cec917c638164c5790191fe9f8
-API Base:       https://llm.bayanatkom.com
-API Version:    v1
-
-Model Configurations:
-  - Model Name:       Snowflake/Arctic-Text2SQL-R1-7B
-  - Max Input Tokens: 8192
-
-Default Model: Snowflake/Arctic-Text2SQL-R1-7B
+Default Model: Qwen/Qwen2.5-14B-Instruct-AWQ
 ```
 
 ---

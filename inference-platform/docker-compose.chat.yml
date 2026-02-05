@@ -1,7 +1,7 @@
 version: "3.9"
 
 services:
-  # Chat - Qwen 2.5 7B on GPU 1
+  # Chat - Qwen 2.5 14B AWQ with YaRN for 95K context support
   chat:
     image: vllm/vllm-openai:latest
     container_name: vllm-chat
@@ -9,9 +9,10 @@ services:
     ipc: host
     environment:
       - HF_TOKEN=${HUGGING_FACE_HUB_TOKEN}
-      - NVIDIA_VISIBLE_DEVICES=1
+      - NVIDIA_VISIBLE_DEVICES=0,1,2,3
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      - CUDA_VISIBLE_DEVICES=0
+      # Required to allow max_model_len > max_position_embeddings
+      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
     volumes:
       - ${HF_HOME:-./hf-cache}:/root/.cache/huggingface
     expose:
@@ -21,18 +22,21 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]
+              device_ids: ["0", "1", "2", "3"]
               capabilities: [gpu]
     command: >
-      --model Qwen/Qwen2.5-7B-Instruct
+      --model Qwen/Qwen2.5-14B-Instruct-AWQ
       --host 0.0.0.0
       --port 8000
       --api-key ${BACKEND_API_KEY}
-      --max-model-len 8192
-      --gpu-memory-utilization 0.95
-      --dtype auto
+      --max-model-len 97280
+      --tensor-parallel-size 4
+      --gpu-memory-utilization 0.92
+      --quantization awq
       --enable-auto-tool-choice
       --tool-call-parser hermes
+      --enable-chunked-prefill
+      --max-num-seqs 64
 
 networks:
   default:

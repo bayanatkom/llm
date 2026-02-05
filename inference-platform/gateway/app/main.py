@@ -33,12 +33,20 @@ settings.validate()
 _rr_chat_index = itertools.cycle(range(len(settings.get_chat_backends())))
 
 # Model name mapping (OpenRouter-style -> HuggingFace-style)
+# Consolidated: Single Qwen 14B AWQ model for all tasks (chat + text2sql)
 MODEL_ALIASES = {
-    "qwen/qwen-2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
-    "qwen-2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
-    "snowflake/arctic-text2sql-r1-7b": "Snowflake/Arctic-Text2SQL-R1-7B",
-    "arctic-text2sql-7b": "Snowflake/Arctic-Text2SQL-R1-7B",
-    "arctic-text2sql-r1-7b": "Snowflake/Arctic-Text2SQL-R1-7B",
+    # Chat/General model - Qwen 14B AWQ (95K context with YaRN)
+    "qwen/qwen-2.5-14b-instruct": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    "qwen/qwen-2.5-14b-instruct-awq": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    "qwen-2.5-14b-instruct": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    "qwen-2.5-14b": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    # Legacy 7B aliases redirect to 14B AWQ
+    "qwen/qwen-2.5-7b-instruct": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    "qwen-2.5-7b-instruct": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    # Text2SQL aliases - now handled by Qwen 14B AWQ
+    "snowflake/arctic-text2sql-r1-7b": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    "arctic-text2sql-7b": "Qwen/Qwen2.5-14B-Instruct-AWQ",
+    "arctic-text2sql-r1-7b": "Qwen/Qwen2.5-14B-Instruct-AWQ",
 }
 
 
@@ -449,10 +457,10 @@ async def list_models():
     
     # Combined OpenAI + OpenRouter compatible schema
     models = [
-        # Chat model - Qwen 2.5 7B Instruct
+        # Chat & Text2SQL model - Qwen 2.5 14B Instruct AWQ (95K context with YaRN)
         {
             # OpenAI standard fields
-            "id": "qwen/qwen-2.5-7b-instruct",
+            "id": "qwen/qwen-2.5-14b-instruct",
             "object": "model",
             "created": current_time,
             "owned_by": "bayanatkom",
@@ -472,13 +480,13 @@ async def list_models():
                     "is_blocking": False
                 }
             ],
-            "root": "qwen/qwen-2.5-7b-instruct",
+            "root": "qwen/qwen-2.5-14b-instruct",
             "parent": None,
             # OpenRouter additional fields
-            "canonical_slug": "qwen/qwen-2.5-7b-instruct",
-            "name": "Qwen 2.5 7B Instruct",
-            "description": "Qwen 2.5 7B Instruct - A powerful multilingual chat model. Accepts: qwen/qwen-2.5-7b-instruct OR Qwen/Qwen2.5-7B-Instruct",
-            "context_length": 8192,
+            "canonical_slug": "qwen/qwen-2.5-14b-instruct",
+            "name": "Qwen 2.5 14B Instruct AWQ",
+            "description": "Qwen 2.5 14B Instruct AWQ - 95K context with YaRN, 4-bit AWQ quantization, supports tool calling. Handles chat and text2SQL. Running on 4x L4 GPUs with ~3.9x concurrent capacity.",
+            "context_length": 97280,
             "architecture": {
                 "input_modalities": ["text"],
                 "output_modalities": ["text"],
@@ -491,8 +499,8 @@ async def list_models():
                 "request": "0"
             },
             "top_provider": {
-                "context_length": 8192,
-                "max_completion_tokens": 4096,
+                "context_length": 97280,
+                "max_completion_tokens": 8192,
                 "is_moderated": False
             },
             "supported_parameters": [
@@ -502,10 +510,12 @@ async def list_models():
                 "stream",
                 "stop",
                 "frequency_penalty",
-                "presence_penalty"
+                "presence_penalty",
+                "tools",
+                "tool_choice"
             ]
         },
-        # Text2SQL model - Snowflake Arctic
+        # Legacy Text2SQL alias (redirects to Qwen 14B)
         {
             # OpenAI standard fields
             "id": "snowflake/arctic-text2sql-r1-7b",
@@ -532,14 +542,14 @@ async def list_models():
             "parent": None,
             # OpenRouter additional fields
             "canonical_slug": "snowflake/arctic-text2sql-r1-7b",
-            "name": "Snowflake Arctic Text2SQL R1 7B",
-            "description": "Snowflake Arctic Text2SQL R1 - SQL generation model. Accepts: snowflake/arctic-text2sql-r1-7b OR Snowflake/Arctic-Text2SQL-R1-7B",
-            "context_length": 8192,
+            "name": "Text2SQL (Legacy - uses Qwen 14B)",
+            "description": "Legacy alias - redirects to Qwen 2.5 14B Instruct for SQL generation. Use qwen/qwen-2.5-14b-instruct for 128K context.",
+            "context_length": 131072,
             "architecture": {
                 "input_modalities": ["text"],
                 "output_modalities": ["text"],
                 "tokenizer": "Qwen",
-                "instruct_type": "completion"
+                "instruct_type": "chat"
             },
             "pricing": {
                 "prompt": "0",
@@ -547,8 +557,8 @@ async def list_models():
                 "request": "0"
             },
             "top_provider": {
-                "context_length": 8192,
-                "max_completion_tokens": 4096,
+                "context_length": 131072,
+                "max_completion_tokens": 8192,
                 "is_moderated": False
             },
             "supported_parameters": [
@@ -556,7 +566,9 @@ async def list_models():
                 "top_p",
                 "max_tokens",
                 "stream",
-                "stop"
+                "stop",
+                "tools",
+                "tool_choice"
             ]
         }
     ]
