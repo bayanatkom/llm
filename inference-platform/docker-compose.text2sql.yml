@@ -1,0 +1,38 @@
+version: "3.9"
+
+services:
+  # Text2SQL - Snowflake Arctic on GPU 0
+  text2sql:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-text2sql
+    restart: unless-stopped
+    ipc: host
+    environment:
+      - HF_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ${HF_HOME:-./hf-cache}:/root/.cache/huggingface
+    expose:
+      - "8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    command: >
+      --model Snowflake/Arctic-Text2SQL-R1-7B
+      --host 0.0.0.0
+      --port 8000
+      --api-key ${BACKEND_API_KEY}
+      --max-model-len 8192
+      --gpu-memory-utilization 0.95
+      --dtype auto
+
+networks:
+  default:
+    name: inference-network
+    external: false

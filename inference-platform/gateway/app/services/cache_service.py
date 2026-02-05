@@ -52,60 +52,60 @@ class CacheService:
         # Hash to create key
         return hashlib.sha256(cache_str.encode()).hexdigest()
     
-    def get(
-        self,
-        model: str,
-        messages: list,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        **kwargs
-    ) -> Optional[Any]:
+    def get_cache_key(self, payload: dict) -> str:
         """
-        Get cached response if available.
+        Generate cache key from request payload.
         
         Args:
-            model: Model name
-            messages: Chat messages
-            temperature: Temperature parameter
-            max_tokens: Max tokens parameter
-            **kwargs: Other parameters
+            payload: Request payload dictionary
+            
+        Returns:
+            Cache key string
+        """
+        return self._generate_cache_key(
+            model=payload.get("model", ""),
+            messages=payload.get("messages", []),
+            temperature=payload.get("temperature", 0.7),
+            max_tokens=payload.get("max_tokens", 2048),
+            prompt=payload.get("prompt", ""),
+            stop=payload.get("stop"),
+            top_p=payload.get("top_p"),
+        )
+    
+    def get(self, cache_key: str) -> Optional[Any]:
+        """
+        Get cached response by key.
+        
+        Args:
+            cache_key: Cache key from get_cache_key()
             
         Returns:
             Cached response or None
         """
-        # Don't cache if temperature is high (non-deterministic)
-        if temperature > 0.3:
-            return None
-        
-        key = self._generate_cache_key(model, messages, temperature, max_tokens, **kwargs)
-        return self.cache.get(key)
+        return self.cache.get(cache_key)
     
-    def set(
-        self,
-        response: Any,
-        model: str,
-        messages: list,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        **kwargs
-    ):
+    def set(self, cache_key: str, response: Any) -> None:
         """
-        Cache a response.
+        Cache a response by key.
         
         Args:
+            cache_key: Cache key from get_cache_key()
             response: Response to cache
-            model: Model name
-            messages: Chat messages
-            temperature: Temperature parameter
-            max_tokens: Max tokens parameter
-            **kwargs: Other parameters
         """
-        # Don't cache if temperature is high
-        if temperature > 0.3:
-            return
+        self.cache[cache_key] = response
+    
+    def should_cache(self, payload: dict) -> bool:
+        """
+        Check if payload should be cached (low temperature only).
         
-        key = self._generate_cache_key(model, messages, temperature, max_tokens, **kwargs)
-        self.cache[key] = response
+        Args:
+            payload: Request payload dictionary
+            
+        Returns:
+            True if cacheable, False otherwise
+        """
+        temperature = payload.get("temperature", 0.7)
+        return temperature <= 0.3
     
     def clear(self):
         """Clear all cached responses."""

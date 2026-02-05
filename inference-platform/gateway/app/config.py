@@ -1,7 +1,8 @@
 """Configuration management for the gateway."""
 import os
-from typing import List
+from typing import List, Optional
 from pydantic_settings import BaseSettings
+from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -11,11 +12,9 @@ class Settings(BaseSettings):
     gateway_api_key: str = os.getenv("GATEWAY_API_KEY", "")
     backend_api_key: str = os.getenv("BACKEND_API_KEY", "")
     
-    # Backend URLs
-    chat_backends: List[str] = []
+    # Backend URLs - using Optional to prevent early parsing
+    chat_backends: Optional[str] = None
     text2sql_backend: str = ""
-    embed_backend: str = ""
-    rerank_backend: str = ""
     
     # Rate Limiting
     max_rps_per_ip: float = 50.0
@@ -54,16 +53,19 @@ class Settings(BaseSettings):
     # Gateway
     gateway_workers: int = 4
     
+    chat_backends_list: List[str] = []
+    
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         # Parse backend URLs from environment
         chat_backends_str = os.getenv("CHAT_BACKENDS", "")
         if chat_backends_str:
-            self.chat_backends = [b.strip() for b in chat_backends_str.split(",") if b.strip()]
+            self.chat_backends_list = [b.strip() for b in chat_backends_str.split(",") if b.strip()]
+        elif self.chat_backends:
+            self.chat_backends_list = [b.strip() for b in self.chat_backends.split(",") if b.strip()]
         
-        self.text2sql_backend = os.getenv("TEXT2SQL_BACKEND", "").strip()
-        self.embed_backend = os.getenv("EMBED_BACKEND", "").strip()
-        self.rerank_backend = os.getenv("RERANK_BACKEND", "").strip()
+        if not self.text2sql_backend:
+            self.text2sql_backend = os.getenv("TEXT2SQL_BACKEND", "").strip()
         
         # Override from env if present
         self.max_rps_per_ip = float(os.getenv("MAX_RPS_PER_IP", "50"))
@@ -80,17 +82,15 @@ class Settings(BaseSettings):
         if not self.gateway_api_key or not self.backend_api_key:
             raise ValueError("GATEWAY_API_KEY and BACKEND_API_KEY must be set")
         
-        if not self.chat_backends:
+        if not self.chat_backends_list:
             raise ValueError("CHAT_BACKENDS must be set")
         
         if not self.text2sql_backend:
             raise ValueError("TEXT2SQL_BACKEND must be set")
-        
-        if not self.embed_backend:
-            raise ValueError("EMBED_BACKEND must be set")
-        
-        if not self.rerank_backend:
-            raise ValueError("RERANK_BACKEND must be set")
+    
+    def get_chat_backends(self) -> List[str]:
+        """Get parsed chat backends list."""
+        return self.chat_backends_list
 
 
 # Global settings instance

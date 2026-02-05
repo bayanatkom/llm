@@ -82,6 +82,52 @@ class CircuitBreaker:
                 self.state = CircuitState.OPEN
                 circuit_breaker_state.labels(backend=self.backend_name).set(self.state.value)
     
+    def __enter__(self) -> "CircuitBreaker":
+        """
+        Enter context manager - check circuit state.
+        
+        Returns:
+            Self for context manager usage
+            
+        Raises:
+            CircuitBreakerOpenError: If circuit is open
+        """
+        # Check if we should attempt reset
+        if self._should_attempt_reset():
+            self.state = CircuitState.HALF_OPEN
+            self.success_count = 0
+            circuit_breaker_state.labels(backend=self.backend_name).set(self.state.value)
+        
+        # Reject if circuit is open
+        if self.state == CircuitState.OPEN:
+            raise CircuitBreakerOpenError(
+                f"Circuit breaker open for {self.backend_name}"
+            )
+        
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """
+        Exit context manager - record success or failure.
+        
+        Args:
+            exc_type: Exception type if an exception was raised
+            exc_val: Exception value if an exception was raised
+            exc_tb: Exception traceback if an exception was raised
+            
+        Returns:
+            False to propagate exceptions
+        """
+        if exc_type is None:
+            # No exception, record success
+            self._record_success()
+        else:
+            # Exception occurred, record failure
+            self._record_failure()
+        
+        # Don't suppress exceptions
+        return False
+    
     async def call(self, func: Callable, *args, **kwargs) -> Any:
         """
         Execute function with circuit breaker protection.

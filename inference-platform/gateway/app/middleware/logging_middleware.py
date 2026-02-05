@@ -2,11 +2,20 @@
 import structlog
 import uuid
 import time
+import logging
 from fastapi import Request
 from typing import Callable
 from app.config import settings
 from app.utils.pii_redaction import PIIRedactor
 
+# Map string levels to logging module levels
+LOG_LEVELS = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL
+}
 
 # Configure structlog
 structlog.configure(
@@ -17,7 +26,7 @@ structlog.configure(
         structlog.processors.JSONRenderer()
     ],
     wrapper_class=structlog.make_filtering_bound_logger(
-        getattr(structlog.stdlib, settings.log_level.upper(), structlog.stdlib.INFO)
+        LOG_LEVELS.get(settings.log_level.upper(), logging.INFO)
     ),
     context_class=dict,
     logger_factory=structlog.PrintLoggerFactory(),

@@ -9,8 +9,8 @@ from typing import Optional, Dict, Deque, AsyncIterator
 import httpx
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
+import json
 
 from app.config import settings
 from app.middleware.metrics import metrics_middleware, metrics_endpoint
@@ -30,7 +30,22 @@ from app.middleware.metrics import (
 settings.validate()
 
 # Round-robin iterator for chat backends
-_rr_chat_index = itertools.cycle(range(len(settings.chat_backends)))
+_rr_chat_index = itertools.cycle(range(len(settings.get_chat_backends())))
+
+# Model name mapping (OpenRouter-style -> HuggingFace-style)
+MODEL_ALIASES = {
+    "qwen/qwen-2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
+    "qwen-2.5-7b-instruct": "Qwen/Qwen2.5-7B-Instruct",
+    "snowflake/arctic-text2sql-r1-7b": "Snowflake/Arctic-Text2SQL-R1-7B",
+    "arctic-text2sql-7b": "Snowflake/Arctic-Text2SQL-R1-7B",
+    "arctic-text2sql-r1-7b": "Snowflake/Arctic-Text2SQL-R1-7B",
+}
+
+
+def resolve_model_name(model: str) -> str:
+    """Resolve model alias to actual model name."""
+    return MODEL_ALIASES.get(model.lower(), model)
+
 
 # HTTP client with optimized settings
 limits = httpx.Limits(max_connections=3000, max_keepalive_connections=800, keepalive_expiry=30.0)
@@ -56,10 +71,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add middleware
+# Add middleware (NO GZip - it breaks SSE streaming for litellm/openrouter)
 app.middleware("http")(metrics_middleware)
 app.middleware("http")(logging_middleware)
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+# Removed GZipMiddleware as it can corrupt SSE text/event-stream responses
 
 
 # ----------------------------
@@ -148,318 +163,543 @@ def gc_idle(ip_idle_secs: float = 900.0) -> None:
         _ip_hits.pop(ip, None)
 
 
-async def acquire_slot_or_429(sem: asyncio.Semaphore, ip: str) -> None:
-    """Acquire concurrency slot or raise 429."""
-    queue_start = time.time()
-    try:
-        await asyncio.wait_for(sem.acquire(), timeout=settings.queue_timeout_secs)
-        wait_time = time.time() - queue_start
-        queue_wait_time.labels(org_ip=ip).observe(wait_time)
-    except asyncio.TimeoutError:
-        rate_limit_rejections.labels(org_ip=ip, reason="queue_timeout").inc()
-        raise HTTPException(
-            status_code=429,
-            detail="Too many concurrent requests",
-            headers={"Retry-After": str(int(max(1, settings.queue_timeout_secs)))}
-        )
-
-
-# ----------------------------
-# Backend Proxy Functions
-# ----------------------------
-
-async def proxy_json(url: str, payload: dict, backend_type: str) -> JSONResponse:
-    """Proxy JSON request to backend."""
-    start_time = time.time()
-    
-    async def _do():
-        r = await client.post(url, json=payload, headers=backend_headers())
-        backend_requests.labels(backend=url, type=backend_type, status=r.status_code).inc()
-        return JSONResponse(status_code=r.status_code, content=r.json())
-    
-    try:
-        result = await circuit_breaker_manager.call(url, _do)
-        duration = time.time() - start_time
-        backend_duration.labels(backend=url, type=backend_type).observe(duration)
-        return result
-    except CircuitBreakerOpenError:
-        raise HTTPException(status_code=503, detail="Backend temporarily unavailable")
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Request timeout")
-
-
-async def _stream_with_caps(r: httpx.Response) -> AsyncIterator[bytes]:
-    """Stream response with timeout caps."""
-    start = time.time()
-    aiter = r.aiter_raw()
-    
-    while True:
-        if time.time() - start > settings.max_request_secs:
-            break
-        
-        try:
-            chunk = await asyncio.wait_for(
-                aiter.__anext__(),
-                timeout=settings.stream_idle_timeout_secs
-            )
-        except asyncio.TimeoutError:
-            break
-        except StopAsyncIteration:
-            break
-        
-        if chunk:
-            yield chunk
-
-
-async def proxy_stream(url: str, payload: dict, backend_type: str) -> StreamingResponse:
-    """Proxy streaming request to backend."""
-    start_time = time.time()
-    
-    async def gen():
-        try:
-            async def _stream():
-                async with client.stream("POST", url, json=payload, headers=backend_headers()) as r:
-                    backend_requests.labels(backend=url, type=backend_type, status=r.status_code).inc()
-                    async for chunk in _stream_with_caps(r):
-                        yield chunk
-            
-            async for chunk in circuit_breaker_manager.call(url, _stream):
-                yield chunk
-            
-            duration = time.time() - start_time
-            backend_duration.labels(backend=url, type=backend_type).observe(duration)
-        
-        except CircuitBreakerOpenError:
-            yield b'data: {"error": "Backend temporarily unavailable"}\n\n'
-    
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-async def admit(req: Request, authorization: Optional[str]) -> tuple[asyncio.Semaphore, str]:
-    """Admission control: auth, rate limit, concurrency."""
-    global _req_counter
-    
-    require_api_key(authorization)
-    ip = get_client_ip(req)
-    
-    # Rate limiting
-    enforce_rps(ip)
-    
-    # Concurrency control
+@asynccontextmanager
+async def proxy_acq(ip: str) -> AsyncIterator[None]:
+    """Acquire semaphore for IP with queueing timeout."""
     sem = get_ip_sem(ip)
-    await acquire_slot_or_429(sem, ip)
-    
-    # Update queue depth metric
-    queue_depth.labels(org_ip=ip).set(settings.max_inflight_per_ip - sem._value)
     
     # Periodic GC
+    global _req_counter
     _req_counter += 1
     if _req_counter % _gc_every == 0:
         gc_idle()
     
-    return sem, ip
+    # Try to acquire within timeout
+    start = time.time()
+    acquired = False
+    try:
+        queue_depth.labels(org_ip=ip).inc()
+        
+        acquired = await asyncio.wait_for(
+            sem.acquire(),
+            timeout=settings.queue_timeout_secs
+        )
+        
+        elapsed = time.time() - start
+        queue_wait_time.labels(org_ip=ip).observe(elapsed)
+        yield
+        
+    except asyncio.TimeoutError:
+        rate_limit_rejections.labels(org_ip=ip, reason="queue_timeout").inc()
+        raise HTTPException(
+            status_code=429,
+            detail="Queue is full; please retry",
+            headers={"Retry-After": "5"}
+        )
+    finally:
+        queue_depth.labels(org_ip=ip).dec()
+        if acquired:
+            sem.release()
 
 
 # ----------------------------
-# API Endpoints
+# Proxy Functions
 # ----------------------------
+
+async def proxy_json(url: str, payload: dict, backend_type: str) -> dict:
+    """Proxy JSON request to backend."""
+    try:
+        with circuit_breaker_manager.get_breaker(url):
+            backend_requests.labels(backend=url, type=backend_type, status="started").inc()
+            start = time.time()
+            
+            response = await client.post(
+                url,
+                json=payload,
+                headers=backend_headers(),
+                timeout=settings.max_request_secs
+            )
+            
+            backend_duration.labels(backend=url, type=backend_type).observe(time.time() - start)
+            response.raise_for_status()
+            return response.json()
+            
+    except CircuitBreakerOpenError:
+        raise HTTPException(status_code=503, detail="Backend temporarily unavailable")
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Backend request timeout")
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Backend rate limit exceeded")
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backend error: {str(e)}")
+
+
+def sse_error(message: str, err_type: str = "api_error", code: str = None) -> bytes:
+    """Create OpenAI/OpenRouter-compatible SSE error chunk."""
+    payload = {
+        "error": {
+            "message": message,
+            "type": err_type,
+            "code": code
+        }
+    }
+    return f"data: {json.dumps(payload)}\n\n".encode()
+
+
+def clean_stream_chunk(chunk_data: dict) -> dict:
+    """Clean vLLM-specific fields from streaming chunks to improve compatibility."""
+    # Remove vLLM-specific fields that can confuse other parsers
+    vllm_fields_to_remove = [
+        "prompt_token_ids", "prompt_logprobs", "token_ids",
+        "reasoning_content", "stop_reason", "kv_transfer_params"
+    ]
+    
+    # Clean top-level fields
+    for field in vllm_fields_to_remove:
+        chunk_data.pop(field, None)
+    
+    # Clean choice-level fields
+    if "choices" in chunk_data:
+        for choice in chunk_data["choices"]:
+            for field in vllm_fields_to_remove:
+                choice.pop(field, None)
+            # Clean delta fields
+            if "delta" in choice:
+                for field in vllm_fields_to_remove:
+                    choice["delta"].pop(field, None)
+            # Clean message fields
+            if "message" in choice:
+                for field in vllm_fields_to_remove:
+                    choice["message"].pop(field, None)
+    
+    return chunk_data
+
+
+def normalize_error_chunk(chunk_data: dict) -> dict:
+    """Normalize error chunks to OpenAI/OpenRouter format."""
+    if "error" in chunk_data:
+        # If error is a string, convert to proper object format
+        if isinstance(chunk_data["error"], str):
+            chunk_data = {
+                "error": {
+                    "message": chunk_data["error"],
+                    "type": "api_error",
+                    "code": None
+                }
+            }
+    return chunk_data
+
+
+async def stream_proxy(url: str, payload: dict, backend_type: str, request: Request = None) -> StreamingResponse:
+    """Proxy streaming request to backend with response cleanup for compatibility."""
+    payload["stream"] = True
+    
+    # Get request-specific logger if request is provided, otherwise use base logger
+    if request:
+        log = get_request_logger(request)
+    else:
+        import structlog
+        log = structlog.get_logger()
+    
+    async def generate():
+        """Stream generator with timeout handling and response cleanup."""
+        try:
+            with circuit_breaker_manager.get_breaker(url):
+                backend_requests.labels(backend=url, type=backend_type, status="started").inc()
+                start = time.time()
+                
+                # Reset idle timer
+                last_chunk_time = time.time()
+                
+                async with client.stream(
+                    "POST",
+                    url,
+                    json=payload,
+                    headers=backend_headers(),
+                    timeout=httpx.Timeout(
+                        connect=5.0,
+                        read=settings.stream_idle_timeout_secs,
+                        write=None,
+                        pool=None
+                    )
+                ) as response:
+                    # Problem 1 fix: Don't raise_for_status() - handle non-2xx by reading body
+                    if response.status_code >= 400:
+                        raw = await response.aread()
+                        msg = raw.decode("utf-8", errors="replace")
+                        err_type = "api_error"
+                        code = str(response.status_code)
+                        # Try to extract message from JSON error response
+                        try:
+                            err_json = json.loads(msg)
+                            if isinstance(err_json.get("error"), dict):
+                                msg = err_json["error"].get("message", msg)
+                                err_type = err_json["error"].get("type", err_type)
+                                code = err_json["error"].get("code", code)
+                            elif isinstance(err_json.get("error"), str):
+                                msg = err_json["error"]
+                            elif "message" in err_json:
+                                msg = err_json["message"]
+                        except json.JSONDecodeError:
+                            pass  # Use raw message
+                        log.error(f"Backend returned {response.status_code} for {backend_type}: {msg[:200]}")
+                        yield sse_error(msg[:500], err_type, code)
+                        yield b"data: [DONE]\n\n"
+                        return
+                    
+                    backend_duration.labels(backend=url, type=backend_type).observe(time.time() - start)
+                    
+                    async for line in response.aiter_lines():
+                        current_time = time.time()
+                        if current_time - last_chunk_time > settings.stream_idle_timeout_secs:
+                            log.warning(f"Stream idle timeout exceeded for {backend_type}")
+                            break
+                        last_chunk_time = current_time
+                        
+                        # Problem 2 fix: Only forward data: lines, skip other SSE line types
+                        if line.startswith("data: "):
+                            data_content = line[6:]  # Remove "data: " prefix
+                            if data_content.strip() == "[DONE]":
+                                yield b"data: [DONE]\n\n"
+                            else:
+                                try:
+                                    chunk_json = json.loads(data_content)
+                                    
+                                    # Handle error chunks - normalize to OpenAI format
+                                    if "error" in chunk_json:
+                                        chunk_json = normalize_error_chunk(chunk_json)
+                                        yield f"data: {json.dumps(chunk_json)}\n\n".encode()
+                                        continue
+                                    
+                                    cleaned_chunk = clean_stream_chunk(chunk_json)
+                                    yield f"data: {json.dumps(cleaned_chunk)}\n\n".encode()
+                                except json.JSONDecodeError:
+                                    # Pass through non-JSON data as-is
+                                    yield f"{line}\n\n".encode()
+                        # Non data: lines are silently skipped (event:, id:, retry:, comments, etc.)
+                        
+        except CircuitBreakerOpenError:
+            yield sse_error("Backend temporarily unavailable", "service_unavailable", "backend_unavailable")
+            yield b"data: [DONE]\n\n"
+        except httpx.TimeoutException as e:
+            msg = str(e) or "Stream timeout"
+            log.error(f"Stream timeout for {backend_type}: {msg}")
+            yield sse_error(msg[:500], "timeout", "stream_timeout")
+            yield b"data: [DONE]\n\n"
+        except Exception as e:
+            # Problem 3 fix: Use real exception message instead of generic "Stream error"
+            msg = str(e) or e.__class__.__name__
+            log.error(f"Stream error for {backend_type}: {msg}")
+            yield sse_error(msg[:500], "api_error", "stream_proxy_exception")
+            yield b"data: [DONE]\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive"
+        }
+    )
+
+
+# ----------------------------
+# Routes
+# ----------------------------
+
+@app.get("/")
+async def root():
+    """Root endpoint."""
+    return {"service": "Enterprise Inference Gateway", "status": "healthy"}
+
 
 @app.get("/health")
 async def health():
-    """Basic health check."""
-    return {"status": "healthy", "backends": len(settings.chat_backends)}
-
-
-@app.get("/health/detailed")
-async def detailed_health():
-    """Detailed health check with backend status."""
-    return {
-        "status": "healthy",
-        "backends": health_check_service.get_all_status(),
-        "cache": cache_service.get_stats()
-    }
+    """Health check endpoint."""
+    backends_status = health_check_service.get_status()
+    all_healthy = all(
+        len(backends) > 0
+        for backends in backends_status.values()
+    )
+    
+    status_code = 200 if all_healthy else 503
+    return JSONResponse(
+        content={
+            "status": "healthy" if all_healthy else "degraded",
+            "backends": backends_status
+        },
+        status_code=status_code
+    )
 
 
 @app.get("/metrics")
-async def metrics(request: Request):
+async def metrics():
     """Prometheus metrics endpoint."""
-    return await metrics_endpoint(request)
+    return await metrics_endpoint()
+
+
+@app.get("/v1/models")
+async def list_models():
+    """List available models (OpenAI + OpenRouter compatible format)."""
+    import time
+    current_time = int(time.time())
+    
+    # Combined OpenAI + OpenRouter compatible schema
+    models = [
+        # Chat model - Qwen 2.5 7B Instruct
+        {
+            # OpenAI standard fields
+            "id": "qwen/qwen-2.5-7b-instruct",
+            "object": "model",
+            "created": current_time,
+            "owned_by": "bayanatkom",
+            "permission": [
+                {
+                    "id": "modelperm-qwen",
+                    "object": "model_permission",
+                    "created": current_time,
+                    "allow_create_engine": False,
+                    "allow_sampling": True,
+                    "allow_logprobs": True,
+                    "allow_search_indices": False,
+                    "allow_view": True,
+                    "allow_fine_tuning": False,
+                    "organization": "*",
+                    "group": None,
+                    "is_blocking": False
+                }
+            ],
+            "root": "qwen/qwen-2.5-7b-instruct",
+            "parent": None,
+            # OpenRouter additional fields
+            "canonical_slug": "qwen/qwen-2.5-7b-instruct",
+            "name": "Qwen 2.5 7B Instruct",
+            "description": "Qwen 2.5 7B Instruct - A powerful multilingual chat model. Accepts: qwen/qwen-2.5-7b-instruct OR Qwen/Qwen2.5-7B-Instruct",
+            "context_length": 8192,
+            "architecture": {
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "tokenizer": "Qwen",
+                "instruct_type": "chat"
+            },
+            "pricing": {
+                "prompt": "0",
+                "completion": "0",
+                "request": "0"
+            },
+            "top_provider": {
+                "context_length": 8192,
+                "max_completion_tokens": 4096,
+                "is_moderated": False
+            },
+            "supported_parameters": [
+                "temperature",
+                "top_p",
+                "max_tokens",
+                "stream",
+                "stop",
+                "frequency_penalty",
+                "presence_penalty"
+            ]
+        },
+        # Text2SQL model - Snowflake Arctic
+        {
+            # OpenAI standard fields
+            "id": "snowflake/arctic-text2sql-r1-7b",
+            "object": "model",
+            "created": current_time,
+            "owned_by": "bayanatkom",
+            "permission": [
+                {
+                    "id": "modelperm-text2sql",
+                    "object": "model_permission",
+                    "created": current_time,
+                    "allow_create_engine": False,
+                    "allow_sampling": True,
+                    "allow_logprobs": True,
+                    "allow_search_indices": False,
+                    "allow_view": True,
+                    "allow_fine_tuning": False,
+                    "organization": "*",
+                    "group": None,
+                    "is_blocking": False
+                }
+            ],
+            "root": "snowflake/arctic-text2sql-r1-7b",
+            "parent": None,
+            # OpenRouter additional fields
+            "canonical_slug": "snowflake/arctic-text2sql-r1-7b",
+            "name": "Snowflake Arctic Text2SQL R1 7B",
+            "description": "Snowflake Arctic Text2SQL R1 - SQL generation model. Accepts: snowflake/arctic-text2sql-r1-7b OR Snowflake/Arctic-Text2SQL-R1-7B",
+            "context_length": 8192,
+            "architecture": {
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "tokenizer": "Qwen",
+                "instruct_type": "completion"
+            },
+            "pricing": {
+                "prompt": "0",
+                "completion": "0",
+                "request": "0"
+            },
+            "top_provider": {
+                "context_length": 8192,
+                "max_completion_tokens": 4096,
+                "is_moderated": False
+            },
+            "supported_parameters": [
+                "temperature",
+                "top_p",
+                "max_tokens",
+                "stream",
+                "stop"
+            ]
+        }
+    ]
+    
+    return {
+        "object": "list",
+        "data": models
+    }
+
+
+@app.get("/api/v1/models")
+async def list_models_openrouter():
+    """List available models (OpenRouter API path alias).
+    
+    Many OpenRouter-compatible tools call /api/v1/models instead of /v1/models.
+    This alias returns the same data in OpenRouter-preferred format.
+    """
+    response = await list_models()
+    # OpenRouter style typically omits "object": "list"
+    return {"data": response["data"]}
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request, authorization: Optional[str] = Header(default=None)):
-    """Chat completions endpoint (load-balanced across chat backends)."""
-    sem, ip = await admit(req, authorization)
-    log = get_request_logger(req)
+    """Chat completions endpoint with round-robin backend selection."""
+    ip = get_client_ip(req)
+    enforce_rps(ip)
+    require_api_key(authorization)
     
-    try:
+    async with proxy_acq(ip):
         payload = await req.json()
         
-        # Estimate tokens for quota check
-        messages = payload.get("messages", [])
-        estimated_tokens = count_chat_tokens(messages, "qwen")
-        estimated_tokens += token_counter.estimate_completion_tokens(payload.get("max_tokens"))
+        # Resolve model name aliases (OpenRouter-style -> HuggingFace-style)
+        if "model" in payload:
+            payload["model"] = resolve_model_name(payload["model"])
         
-        # Check quota
-        allowed, reason = quota_manager.check_quota(ip, estimated_tokens)
-        if not allowed:
-            log.warning("quota_exceeded", reason=reason)
-            raise HTTPException(status_code=429, detail=reason)
+        # Count input tokens
+        input_tokens = count_chat_tokens(payload.get("messages", []))
         
-        # Check cache for non-streaming requests
-        if not payload.get("stream"):
-            cached = cache_service.get(
-                model="qwen",
-                messages=messages,
-                temperature=payload.get("temperature", 0.7),
-                max_tokens=payload.get("max_tokens", 2048)
+        # Check quota before processing
+        if not quota_manager.check_quota(ip, input_tokens):
+            raise HTTPException(
+                status_code=429,
+                detail="Quota exceeded",
+                headers={"X-Quota-Reset": quota_manager.get_reset_time(ip)}
             )
-            if cached:
-                log.info("cache_hit")
-                return JSONResponse(content=cached)
         
-        # Get healthy backend
+        # Select backend round-robin
+        idx = next(_rr_chat_index)
         try:
-            backend = health_check_service.get_healthy_backend("chat")
+            backend = health_check_service.get_healthy_backend("chat", idx)
         except ValueError as e:
             raise HTTPException(status_code=503, detail=str(e))
         
         url = f"{backend}/v1/chat/completions"
         
-        # Proxy request
-        if payload.get("stream"):
-            result = await proxy_stream(url, payload, "chat")
+        if payload.get("stream", False):
+            # Handle streaming
+            result = await stream_proxy(url, payload, "chat", req)
+            
+            # Record usage (approximate for streaming)
+            output_tokens = 500  # Approximate
+            total_tokens = input_tokens + output_tokens
+            quota_manager.record_usage(ip, total_tokens)
+            tokens_processed.labels(org_ip=ip, model=payload.get("model", "unknown"), type="chat").inc(total_tokens)
+            
+            return result
         else:
+            # Cache check for non-streaming
+            cache_key = cache_service.get_cache_key(payload)
+            cached_result = cache_service.get(cache_key)
+            if cached_result:
+                quota_manager.record_usage(ip, 0)  # No tokens for cache hit
+                return cached_result
+            
+            # Non-streaming proxy
             result = await proxy_json(url, payload, "chat")
-            # Cache successful responses
-            if result.status_code == 200:
-                cache_service.set(
-                    response=result.body.decode() if hasattr(result, 'body') else result,
-                    model="qwen",
-                    messages=messages,
-                    temperature=payload.get("temperature", 0.7),
-                    max_tokens=payload.get("max_tokens", 2048)
-                )
-        
-        # Record usage
-        quota_manager.record_usage(ip, estimated_tokens)
-        tokens_processed.labels(org_ip=ip, model="qwen", type="total").inc(estimated_tokens)
-        
-        return result
-    
-    finally:
-        sem.release()
-        queue_depth.labels(org_ip=ip).set(settings.max_inflight_per_ip - sem._value)
+            
+            # Cache response
+            cache_service.set(cache_key, result)
+            
+            # Record usage
+            usage = result.get("usage", {})
+            total_tokens = usage.get("total_tokens", 0)
+            quota_manager.record_usage(ip, total_tokens)
+            tokens_processed.labels(org_ip=ip, model=payload.get("model", "unknown"), type="chat").inc(total_tokens)
+            
+            return result
 
 
-@app.post("/v1/text2sql")
-async def text2sql(req: Request, authorization: Optional[str] = Header(default=None)):
-    """Text2SQL endpoint."""
-    sem, ip = await admit(req, authorization)
-    log = get_request_logger(req)
+@app.post("/v1/completions")
+async def sql_completions(req: Request, authorization: Optional[str] = Header(default=None)):
+    """Text completions endpoint for SQL generation."""
+    ip = get_client_ip(req)
+    enforce_rps(ip)
+    require_api_key(authorization)
     
-    try:
+    async with proxy_acq(ip):
         payload = await req.json()
         
-        # Estimate tokens
-        messages = payload.get("messages", [])
-        estimated_tokens = count_chat_tokens(messages, "text2sql")
-        estimated_tokens += token_counter.estimate_completion_tokens(payload.get("max_tokens"))
+        # Resolve model name aliases (OpenRouter-style -> HuggingFace-style)
+        if "model" in payload:
+            payload["model"] = resolve_model_name(payload["model"])
         
-        # Check quota
-        allowed, reason = quota_manager.check_quota(ip, estimated_tokens)
-        if not allowed:
-            log.warning("quota_exceeded", reason=reason)
-            raise HTTPException(status_code=429, detail=reason)
+        # Count input tokens (roughly)
+        prompt = payload.get("prompt", "")
+        input_tokens = len(prompt.split()) * 2  # Approximate
         
-        # Get backend
+        # Check quota before processing
+        if not quota_manager.check_quota(ip, input_tokens):
+            raise HTTPException(
+                status_code=429,
+                detail="Quota exceeded",
+                headers={"X-Quota-Reset": quota_manager.get_reset_time(ip)}
+            )
+        
+        # Use text2sql backend
         try:
             backend = health_check_service.get_healthy_backend("text2sql")
         except ValueError as e:
             raise HTTPException(status_code=503, detail=str(e))
         
-        url = f"{backend}/v1/chat/completions"
+        url = f"{backend}/v1/completions"
         
-        # Proxy request
-        if payload.get("stream"):
-            result = await proxy_stream(url, payload, "text2sql")
+        if payload.get("stream", False):
+            # Handle streaming
+            result = await stream_proxy(url, payload, "text2sql", req)
+            
+            # Record usage (approximate for streaming)
+            output_tokens = 200  # Approximate
+            total_tokens = input_tokens + output_tokens
+            quota_manager.record_usage(ip, total_tokens)
+            tokens_processed.labels(org_ip=ip, model=payload.get("model", "unknown"), type="text2sql").inc(total_tokens)
+            
+            return result
         else:
+            # Non-streaming proxy
             result = await proxy_json(url, payload, "text2sql")
-        
-        # Record usage
-        quota_manager.record_usage(ip, estimated_tokens)
-        tokens_processed.labels(org_ip=ip, model="text2sql", type="total").inc(estimated_tokens)
-        
-        return result
-    
-    finally:
-        sem.release()
-        queue_depth.labels(org_ip=ip).set(settings.max_inflight_per_ip - sem._value)
-
-
-@app.post("/v1/embeddings")
-async def embeddings(req: Request, authorization: Optional[str] = Header(default=None)):
-    """Embeddings endpoint."""
-    sem, ip = await admit(req, authorization)
-    
-    try:
-        payload = await req.json()
-        
-        # Get backend
-        try:
-            backend = health_check_service.get_healthy_backend("embed")
-        except ValueError as e:
-            raise HTTPException(status_code=503, detail=str(e))
-        
-        url = f"{backend}/v1/embeddings"
-        result = await proxy_json(url, payload, "embed")
-        
-        # Record usage (embeddings don't count toward token quota)
-        quota_manager.record_usage(ip, 0)
-        
-        return result
-    
-    finally:
-        sem.release()
-        queue_depth.labels(org_ip=ip).set(settings.max_inflight_per_ip - sem._value)
-
-
-@app.post("/v1/rerank")
-async def rerank(req: Request, authorization: Optional[str] = Header(default=None)):
-    """Rerank endpoint."""
-    sem, ip = await admit(req, authorization)
-    
-    try:
-        payload = await req.json()
-        
-        # Get backend
-        try:
-            backend = health_check_service.get_healthy_backend("rerank")
-        except ValueError as e:
-            raise HTTPException(status_code=503, detail=str(e))
-        
-        url = f"{backend}/rerank"
-        result = await proxy_json(url, payload, "rerank")
-        
-        # Record usage
-        quota_manager.record_usage(ip, 0)
-        
-        return result
-    
-    finally:
-        sem.release()
-        queue_depth.labels(org_ip=ip).set(settings.max_inflight_per_ip - sem._value)
-
-
-@app.get("/admin/quota/{org_ip}")
-async def get_quota(org_ip: str, authorization: Optional[str] = Header(default=None)):
-    """Get quota usage for an organization."""
-    require_api_key(authorization)
-    return quota_manager.get_usage(org_ip)
-
-
-@app.get("/admin/quotas")
-async def get_all_quotas(authorization: Optional[str] = Header(default=None)):
-    """Get quota usage for all organizations."""
-    require_api_key(authorization)
-    return quota_manager.get_all_usage()
+            
+            # Record usage
+            usage = result.get("usage", {})
+            total_tokens = usage.get("total_tokens", 0)
+            quota_manager.record_usage(ip, total_tokens)
+            tokens_processed.labels(org_ip=ip, model=payload.get("model", "unknown"), type="text2sql").inc(total_tokens)
+            
+            return result

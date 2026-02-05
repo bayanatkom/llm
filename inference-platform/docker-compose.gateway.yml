@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  # Gateway (CPU) - Enterprise features
+  gateway:
+    build: ./gateway
+    container_name: inference-gateway
+    restart: unless-stopped
+    environment:
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY}
+      - BACKEND_API_KEY=${BACKEND_API_KEY}
+      - CHAT_BACKENDS=${CHAT_BACKENDS}
+      - TEXT2SQL_BACKEND=${TEXT2SQL_BACKEND}
+      - MAX_RPS_PER_IP=${MAX_RPS_PER_IP}
+      - RPS_WINDOW_SECS=${RPS_WINDOW_SECS}
+      - RPS_BURST=${RPS_BURST}
+      - MAX_INFLIGHT_PER_IP=${MAX_INFLIGHT_PER_IP}
+      - QUEUE_TIMEOUT_SECS=${QUEUE_TIMEOUT_SECS}
+      - MAX_REQUEST_SECS=${MAX_REQUEST_SECS}
+      - STREAM_IDLE_TIMEOUT_SECS=${STREAM_IDLE_TIMEOUT_SECS}
+      - ORG_DAILY_TOKEN_LIMIT=${ORG_DAILY_TOKEN_LIMIT}
+      - ORG_DAILY_REQUEST_LIMIT=${ORG_DAILY_REQUEST_LIMIT}
+      - ORG_MONTHLY_TOKEN_LIMIT=${ORG_MONTHLY_TOKEN_LIMIT}
+      - CACHE_TTL_SECS=${CACHE_TTL_SECS}
+      - CACHE_MAX_SIZE=${CACHE_MAX_SIZE}
+      - CIRCUIT_FAILURE_THRESHOLD=${CIRCUIT_FAILURE_THRESHOLD}
+      - CIRCUIT_RECOVERY_TIMEOUT=${CIRCUIT_RECOVERY_TIMEOUT}
+      - HEALTH_CHECK_INTERVAL_SECS=${HEALTH_CHECK_INTERVAL_SECS}
+      - HEALTH_CHECK_TIMEOUT_SECS=${HEALTH_CHECK_TIMEOUT_SECS}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ENABLE_PII_REDACTION=${ENABLE_PII_REDACTION}
+      - GATEWAY_WORKERS=${GATEWAY_WORKERS}
+    expose:
+      - "9000"
+
+  # Nginx TLS (public)
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: inference-nginx
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../ssl_certificate:/etc/nginx/ssl:ro
+
+networks:
+  default:
+    name: inference-network
+    external: false
